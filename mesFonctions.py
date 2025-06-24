@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from sklearn.decomposition import PCA
 from nltk.tokenize import word_tokenize
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
@@ -34,7 +35,27 @@ import tensorflow as tf
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModel.from_pretrained("bert-base-uncased")
 from PIL import Image
-import os
+import os 
+import cv2
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.resnet import preprocess_input
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.models import Model
+from tqdm import tqdm
+from sklearn.metrics import adjusted_rand_score
+from sklearn.preprocessing import LabelEncoder
+from nltk.stem import PorterStemmer
+from nltk.tokenize import word_tokenize
+import string
+
+from transformers import AutoModel, AutoTokenizer
+from PIL import Image, ImageOps
+
+model = AutoModel.from_pretrained("bert-base-uncased")
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+
 
 def clean_text(text):
     text = text.lower()
@@ -350,6 +371,10 @@ def reduce_tsne(X):
     tsne = TSNE(n_components=2, random_state=42, perplexity=30)
     return tsne.fit_transform(X.toarray())
 
+def reduce_tsne2(X):
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    return tsne.fit_transform(X)
+
 def reduce_tsne_bert_use(X):
     tsne = TSNE(n_components=2, random_state=42, perplexity=30)
     return tsne.fit_transform(X)
@@ -408,23 +433,6 @@ def get_image_size(path):
         print(f"Erreur avec {filename} : {e}")
         return None
 
-import os
-import cv2
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from tqdm import tqdm
-from sklearn.manifold import TSNE
-from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score
-from sklearn.preprocessing import LabelEncoder
-
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.applications.resnet import preprocess_input
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.models import Model
 
 # 📁 Paramètres
 IMAGE_DIR = "data/images"  # Dossier contenant les images
@@ -490,6 +498,7 @@ def extract_features_orb(path, max_features=128):
 
 # 🧠 CNN Feature extraction (ResNet50 sans couche finale)
 base_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+# base_model = VGG16(weights='imagenet', include_top=False, pooling='avg')
 def extract_features_cnn(path):
     img = preprocess_image_cnn(path)
     img = np.expand_dims(img, axis=0)
@@ -554,17 +563,12 @@ def run_all_methods(df):
     ari_sift = run_analysis(sift_features, true_labels, "SIFT")
     results.append(("SIFT", ari_sift))
 
-    # SURF
-    print("\n⏳ Extraction SURF...")
-    surf_features = np.array([extract_features_surf(p) for p in tqdm(df['image_path'])])
-    ari_surf = run_analysis(surf_features, true_labels, "SURF")
-    results.append(("SURF", ari_surf))
-
     # 📋 Résumé des résultats
     results_df = pd.DataFrame(results, columns=["Méthode", "ARI"])
     results_df.sort_values(by="ARI", ascending=False, inplace=True)
     print("\n📈 Résultats comparatifs :")
     print(results_df)
+    return results_df  # <== ici aussi
 
 def run_all_methods2(df):
     # 🎯 Préparation des labels
@@ -589,3 +593,429 @@ def run_all_methods2(df):
     results_df.sort_values(by="ARI", ascending=False, inplace=True)
     print("\n📈 Résultats comparatifs :")
     print(results_df)
+
+    return results_df  # <== ici aussi
+
+def run_all_methods3(df):
+    # 🎯 Préparation des labels
+    true_labels, label_encoder = prepare_labels(df)
+    
+    results = []
+
+    # SURF
+    print("\n⏳ Extraction SURF...")
+    surf_features = np.array([extract_features_surf(p) for p in tqdm(df['image_path'])])
+    ari_surf = run_analysis(surf_features, true_labels, "SURF")
+    results.append(("SURF", ari_surf))
+
+    # 📋 Résumé des résultats
+    results_df = pd.DataFrame(results, columns=["Méthode", "ARI"])
+    results_df.sort_values(by="ARI", ascending=False, inplace=True)
+    print("\n📈 Résultats comparatifs :")
+    print(results_df)
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dropout, Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Modèles CNN de base
+from tensorflow.keras.applications import VGG16, ResNet50, MobileNetV2
+
+
+def prepare_dataframe(df, image_dir):
+    """Ajoute les chemins complets aux images et encode les labels (sans les transformer en entiers)."""
+    le = LabelEncoder()
+    df["label"] = df["extracted_category"]  # On garde les labels en str
+    df["filename"] = df["image"].apply(lambda x: os.path.join(image_dir, x))
+    return df, le.fit(df["label"])
+
+
+def create_data_generators(df, input_shape, batch_size):
+    """Crée les générateurs de données avec augmentation pour l'entraînement."""
+    df_train, df_test = train_test_split(df, test_size=0.2, stratify=df["label"], random_state=42)
+
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=20,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True
+    )
+
+    test_datagen = ImageDataGenerator(rescale=1./255)
+
+    train_gen = train_datagen.flow_from_dataframe(
+        df_train,
+        x_col="filename",
+        y_col="label",
+        target_size=input_shape[:2],
+        class_mode="categorical",
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    test_gen = test_datagen.flow_from_dataframe(
+        df_test,
+        x_col="filename",
+        y_col="label",
+        target_size=input_shape[:2],
+        class_mode="categorical",
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    return train_gen, test_gen, df_train, df_test
+
+
+def build_model(base_model_class, input_shape, num_classes):
+    """Construit un modèle CNN basé sur un backbone pré-entraîné (VGG, ResNet, etc.)."""
+    base_model = base_model_class(weights="imagenet", include_top=False, input_shape=input_shape)
+    for layer in base_model.layers:
+        layer.trainable = False
+
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(128, activation='relu')(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=base_model.input, outputs=outputs)
+    return model
+
+
+def evaluate_model(model, generator, le, title, cmap):
+    """Évalue le modèle et affiche une matrice de confusion + rapport de classification."""
+    y_true = generator.classes
+    y_pred = np.argmax(model.predict(generator), axis=1)
+
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap,
+                xticklabels=le.classes_, yticklabels=le.classes_)
+    plt.title(f"Matrice de confusion - {title}")
+    plt.xlabel("Prédit")
+    plt.ylabel("Réel")
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n📊 Rapport de classification - {title}")
+    print(classification_report(y_true, y_pred, target_names=le.classes_))
+
+def evaluate_model_2(model, data_gen, label_encoder, title="Evaluation", cmap="Blues"):
+    """Évalue un modèle CNN et affiche la matrice de confusion 7x7."""
+    # Récupération des vraies classes et prédictions
+    y_true = data_gen.classes
+    y_pred_probs = model.predict(data_gen, verbose=0)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # Noms des classes
+    class_names = label_encoder.classes_
+    
+    # 📊 Matrice de confusion
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap=cmap,
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(f"Matrice de confusion - {title}")
+    plt.xlabel("Prédit")
+    plt.ylabel("Réel")
+    plt.tight_layout()
+    plt.show()
+
+    # 🧾 Rapport de classification
+    print(f"\n🧾 Rapport de classification - {title} :\n")
+    print(classification_report(y_true, y_pred, target_names=class_names))
+
+def train_and_evaluate_model(base_model_class, model_name, train_gen, test_gen, input_shape, num_classes, le, epochs=10):
+    """Entraîne un modèle CNN et évalue ses performances sur les sets d'entraînement et test."""
+    print(f"\n🔧 Entraînement du modèle {model_name}...")
+    model = build_model(base_model_class, input_shape, num_classes)
+    model.compile(optimizer=Adam(1e-4), loss="categorical_crossentropy", metrics=["accuracy"])
+
+    early_stop = EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+
+    model.fit(train_gen, validation_data=test_gen, epochs=epochs, callbacks=[early_stop])
+
+    evaluate_model(model, train_gen, le, f"{model_name} - TRAIN", "Blues")
+    evaluate_model(model, test_gen, le, f"{model_name} - TEST", "Greens")
+
+    return model
+
+
+def reduce_pca(X, n_components=50):
+    """Réduit la dimension via PCA avant t-SNE."""
+    pca = PCA(n_components=n_components, random_state=42)
+    return pca.fit_transform(X)
+
+def find_best_k(X, max_k=15):
+    """Affiche la méthode du coude pour choisir k."""
+    distortions = []
+    for k in range(2, max_k + 1):
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        kmeans.fit(X)
+        distortions.append(kmeans.inertia_)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(range(2, max_k + 1), distortions, marker='o')
+    plt.title("Méthode du coude")
+    plt.xlabel("Nombre de clusters k")
+    plt.ylabel("Inertie (Within-cluster sum of squares)")
+    plt.grid(True)
+    plt.show()
+
+# def full_clustering_pipeline(X, y_true, n_clusters=7, name="experiment", logs=[]):
+#     """Pipeline complet : PCA → t-SNE → KMeans → ARI → CSV"""
+#     from sklearn.manifold import TSNE
+#     import time, csv
+#     from datetime import datetime
+
+#     start = time.time()
+
+#     # PCA (réduction initiale pour t-SNE)
+#     X_pca = reduce_pca(X, n_components=50)
+
+#     # t-SNE
+#     tsne = TSNE(n_components=2, random_state=0)
+#     X_tsne = tsne.fit_transform(X_pca)
+
+#     # KMeans
+#     kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+#     labels = kmeans.fit_predict(X)
+
+#     # ARI
+#     ari = adjusted_rand_score(y_true, labels)
+#     elapsed = time.time() - start
+
+#     print(f"{name} → ARI = {ari:.4f}, Temps = {elapsed:.2f}s")
+
+#     # Sauvegarde CSV
+#     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+#     logs.append({
+#         "nom_tentative": name,
+#         "date_heure": now,
+#         "ARI": ari,
+#         "temps_sec": elapsed
+#     })
+
+#     with open("resultats_kmeans.csv", mode="a", newline="") as f:
+#         writer = csv.DictWriter(f, fieldnames=logs[0].keys())
+#         if f.tell() == 0:
+#             writer.writeheader()
+#         writer.writerows(logs)
+
+#     return ari
+
+def full_clustering_pipeline(X, y_true, n_clusters=7, name="experiment", logs=[], show_plot=True):
+    """
+    Pipeline complet : PCA → t-SNE → KMeans → ARI → CSV → Affichage
+    """
+    import time, csv
+    from datetime import datetime
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_rand_score
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import numpy as np
+
+    start = time.time()
+
+    # Étape 1 : PCA
+    pca = PCA(n_components=min(50, X.shape[1]))
+    X_pca = pca.fit_transform(X)
+
+    # Étape 2 : t-SNE sur la sortie PCA
+    tsne = TSNE(n_components=2, random_state=0, init='pca', learning_rate='auto')
+    X_tsne = tsne.fit_transform(X_pca)
+
+    # Étape 3 : Clustering KMeans sur les vecteurs d’origine (non réduits)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    labels = kmeans.fit_predict(X)
+
+    # Étape 4 : Score ARI
+    ari = adjusted_rand_score(y_true, labels)
+    elapsed = time.time() - start
+
+    print(f"{name} → ARI = {ari:.4f}, Temps = {elapsed:.2f}s")
+
+    # Étape 5 : Affichage t-SNE
+    if show_plot:
+        plt.figure(figsize=(10, 5))
+
+        # Prédictions
+        plt.subplot(1, 2, 1)
+        sns.scatterplot(x=X_tsne[:, 0], y=X_tsne[:, 1], hue=labels, palette='tab10', s=50)
+        plt.title(f"KMeans clusters ({n_clusters}) - {name}")
+        plt.xlabel("TSNE-1"); plt.ylabel("TSNE-2")
+
+        # Vraies classes
+        plt.subplot(1, 2, 2)
+        sns.scatterplot(x=X_tsne[:, 0], y=X_tsne[:, 1], hue=y_true, palette='tab20', s=50)
+        plt.title("Vraies catégories")
+        plt.xlabel("TSNE-1"); plt.ylabel("TSNE-2")
+
+        plt.tight_layout()
+        plt.show()
+
+    # Étape 6 : Sauvegarde CSV
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    logs.append({
+        "nom_tentative": name,
+        "date_heure": now,
+        "ARI": ari,
+        "temps_sec": elapsed
+    })
+
+    with open("resultats_kmeans.csv", mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=logs[0].keys())
+        if f.tell() == 0:
+            writer.writeheader()
+        writer.writerows(logs)
+
+    return ari
+
+
+# Fonction pour filtrer les stopwords sur une chaîne de texte
+def filter_stopwords_from_text(text, lang='english'):
+    if not isinstance(text, str):
+        return []
+    
+    # Tokenisation en mots
+    tokens = word_tokenize(text.lower())  # en minuscules
+    
+    # Récupération des stopwords et ponctuations
+    stop_words = set(stopwords.words(lang))
+    punctuation = set(string.punctuation)
+    
+    # Filtrage des tokens : pas de stopwords, pas de ponctuation, mots non vides
+    filtered_tokens = [token for token in tokens if token not in stop_words and token not in punctuation and token.strip() != '']
+    
+    return filtered_tokens
+
+def add_filtered_tokens_column(df, source_col='description', new_col='tokens_filtered', lang='english'):
+    df[new_col] = df[source_col].apply(lambda x: filter_stopwords_from_text(x, lang=lang))
+    return df
+
+def afficher_tokens_supprimes(df, index, col_original='tokens_description', col_filtrée='tokens_filtered'):
+    tokens_originaux = df.loc[index, col_original]
+    tokens_filtres = df.loc[index, col_filtrée]
+
+    tokens_supprimes = [token for token in tokens_originaux if token not in tokens_filtres]
+    
+    print(f"Tokens originaux (ligne {index}):\n{tokens_originaux}\n")
+    print(f"Tokens filtrés (ligne {index}):\n{tokens_filtres}\n")
+    print(f"❌ Tokens supprimés (ligne {index}):\n{tokens_supprimes}")
+
+def stem_tokens_column(df, source_col, new_col):
+    stemmer = PorterStemmer()
+    df[new_col] = df[source_col].apply(
+        lambda tokens: [stemmer.stem(token) for token in tokens if isinstance(token, str)]
+    )
+    return df
+
+def afficher_exemple_stem(df, ligne):
+    print(f"📄 Description originale (ligne {ligne}):\n{df.loc[ligne, 'description']}\n")
+    print(f"📝 Titre original (ligne {ligne}):\n{df.loc[ligne, 'product_name']}\n")
+
+    print(f"🧪 Tokens filtrés description:\n{df.loc[ligne, 'tokens_description_filtered']}\n")
+    print(f"🌱 Tokens stemmés description:\n{df.loc[ligne, 'tokens_description_stemmed']}\n")
+
+    print(f"🧪 Tokens filtrés titre:\n{df.loc[ligne, 'tokens_titre_filtered']}\n")
+    print(f"🌱 Tokens stemmés titre:\n{df.loc[ligne, 'tokens_titre_stemmed']}")
+
+def is_low_contrast(img_rgb, threshold=100):
+    """Renvoie True si au moins un canal a une plage < seuil."""
+    for i in range(3):  # R, G, B
+        c_min = img_rgb[:, :, i].min()
+        c_max = img_rgb[:, :, i].max()
+        if (c_max - c_min) < threshold:
+            return True
+    return False 
+
+def plot_image_and_histogram(image, ax_img, ax_hist, title):
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    ax_img.imshow(img_rgb)
+    ax_img.set_title(title)
+    ax_img.axis('off')
+
+    colors = ('r', 'g', 'b')
+    for i, col in enumerate(colors):
+        hist = cv2.calcHist([img_rgb], [i], None, [256], [0,256])
+        ax_hist.plot(hist, color=col)
+    ax_hist.set_xlim([0,256])
+    ax_hist.set_title('Histogramme')
+
+def apply_contrast_clahe(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl,a,b))
+    final = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    return final 
+
+def equalize_hist_color(image):
+    # Convertir en LAB
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # Égalisation de l'histogramme sur le canal L
+    l_eq = cv2.equalizeHist(l)
+
+    lab_eq = cv2.merge((l_eq, a, b))
+    image_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+    return image_eq
+
+# Égalisation d’histogramme avec PIL.ImageOps.equalize
+def equalize_with_pil(image_cv2):
+    image_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(image_rgb)
+    pil_eq = ImageOps.equalize(pil_img)
+    img_eq = cv2.cvtColor(np.array(pil_eq), cv2.COLOR_RGB2BGR)
+    return img_eq
+
+# Égalisation d’histogramme avec OpenCV (canal L en LAB)
+def equalize_with_cv2(image_cv2):
+    lab = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l_eq = cv2.equalizeHist(l)
+    lab_eq = cv2.merge((l_eq, a, b))
+    image_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+    return image_eq
+
+def rotate_image(image, angle_deg):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+
+    # Matrice de rotation
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+
+    # Appliquer rotation
+    rotated = cv2.warpAffine(image, M, (w, h))
+    return rotated
+
+# Fonction pour afficher image + histogramme
+def plot_gray_image_and_histogram(image, ax_img, ax_hist, title):
+    ax_img.imshow(image, cmap='gray')
+    ax_img.set_title(title)
+    ax_img.axis('off')
+
+    # Histogramme
+    hist = cv2.calcHist([image], [0], None, [256], [0, 256])
+    ax_hist.plot(hist, color='black')
+    ax_hist.set_xlim([0, 256])
+    ax_hist.set_title("Histogramme")
